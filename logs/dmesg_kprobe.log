@@ -1,0 +1,4 @@
+[ 1253.617880] Planted kprobe and kretprobe at kernel_clone
+[ 1253.620528] kprobe: kernel_clone called by fork_test (pid: 40282)
+[ 1253.620603] kretprobe: kernel_clone returned 40283 for fork_test (pid: 40282)
+[ 1253.666400] kprobe and kretprobe at kernel_clone unregistered

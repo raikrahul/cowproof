@@ -1,0 +1,7 @@
+Attaching 2 probes...
+ebpf: clone called by 40345
+ebpf: clone returned 40346
+value in child process: 100
+value in parent process: 100
+
+

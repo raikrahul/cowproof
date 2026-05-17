@@ -1,0 +1,9 @@
+[sudo] password for r: === BEFORE ANY WRITE ===
+parent PFN = 0x401c07   (pid 42541)
+child  PFN = 0x401c07   (pid 42542)
+SAME physical frame: 0x401c07 * 4096 = phys 0x401c07000
+
+=== AFTER CHILD WRITES num=42 ===
+parent PFN = 0x401c07   num=100
+child  PFN = 0x268b1f
+DIFFERENT frames -> COW split confirmed
