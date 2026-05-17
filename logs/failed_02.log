@@ -1,0 +1,10 @@
+[sudo] password for r: === PFN PROOF ===
+parent PFN (pre-fork):     0x34737c
+parent PFN (post-fork):    0x413cf5
+child  PFN (before write): 0x34737c
+child  PFN (after write):  0x34737c
+
+BEFORE WRITE: parent PFN != child PFN -> ALREADY SPLIT
+AFTER WRITE:  child PFN unchanged (stack page was already private)
+
+parent num=100  child num=42

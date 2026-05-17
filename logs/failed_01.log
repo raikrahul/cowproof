@@ -1,0 +1,4 @@
+[sudo] password for r: child  pid=45188  PFN_BEFORE_WRITE = 0x348bf6  num=100
+child  pid=45188  PFN_AFTER_WRITE  = 0x348bf6  num=42
+SAME frame (no COW yet?)
+parent pid=45187  PFN              = 0x34b6b0  num=100
