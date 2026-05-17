@@ -6,7 +6,7 @@ Kernel: `7.0.0-070000rc4-generic` (x86_64). All code compiles and runs. Logs are
 
 ---
 
-## 1
+## 1. The Question
 
 You have a number in memory.
 
@@ -18,7 +18,7 @@ You call `fork()`. Now two processes exist. The CPU put `56` (clone) into `rax`,
 
 The question: when both processes read `num`, are they reading the same bytes from the same DRAM chip? Or did the kernel copy 4096 bytes of memory?
 
-## 2
+## 2. The Split
 
 We wrote a program. Parent reads `num`. Child reads `num`. Both print 100.
 
@@ -44,7 +44,7 @@ parent value: 100
 
 Child changed `num` to 42. Parent still sees 100. They're not sharing anymore. When did the split happen?
 
-## 3
+## 3. The Physical Frame
 
 We need to see the physical address. Not the virtual one you get from `&num` — the actual DRAM row.
 
@@ -60,7 +60,7 @@ bits 12-51  physical frame number (which 4096-byte row of DRAM)
 
 The file `/proc/self/pagemap` exposes this. You divide a virtual address by 4096, multiply by 8, seek to that offset, read 8 bytes. You get the physical frame number.
 
-## 4 — first attempt (broken)
+## 4. First Attempt (Broken)
 
 We put `num` on the stack. Both parent and child call `get_pfn(&num)` and `printf`. Simple.
 
@@ -82,7 +82,7 @@ And the child says "SAME frame" before and after its write — because the paren
 
 The measurement destroyed the thing we were measuring.
 
-## 5 — second attempt (still broken)
+## 5. Second Attempt (Still Broken)
 
 We removed `printf` from the child. The child sends its PFN values through a pipe instead — raw bytes, no stdio. Only the parent prints.
 
@@ -107,7 +107,7 @@ The child's PFN before and after the write stayed `0x34737c` for the same reason
 
 The proof that they shared is hiding in the numbers: child PFN `0x34737c` = parent pre-fork PFN `0x34737c`. The child inherited the original frame. But we can't show simultaneous sharing because any observation from either process writes to the shared page.
 
-## 6 — the problem
+## 6. The Measurement Problem
 
 `num` lives on the stack. `get_pfn()` also writes to the stack (`&entry`, `&fd`, return addresses from function calls). Same 4096-byte page. Every observation is a write. Every write triggers COW.
 
@@ -115,7 +115,7 @@ You cannot read the physical frame number of a page without writing to that page
 
 This is not a bug. This is the mechanism working exactly as designed. The page table doesn't care why you wrote — whether it was your `num = 42` or `pread`'s `&entry` or `printf`'s buffer flush. A write is a write. Bit 1 is 0. Interrupt 14 fires.
 
-## 7 — the fix
+## 7. The Memory Isolation Fix
 
 Two changes:
 
@@ -142,7 +142,7 @@ DIFFERENT frames -> COW split confirmed
 
 After `num = 42`: child moved to `0x268b1f`. The kernel allocated a new 4096-byte frame, copied the old one into it, then the child's store landed on the new copy. Parent stayed at `0x401c07`.
 
-## 8
+## 8. The Page Table Walk
 
 But pagemap only shows the final frame number. The CPU doesn't jump straight to it. It walks through 4 tables, each one a 4096-byte array of 8-byte entries. The virtual address is split into 5 fields — four table indexes and a byte offset.
 
@@ -160,7 +160,7 @@ The CPU reads the CR3 register → that's the physical address of table 1. It re
 
 To see every level, we need ring 0. We wrote a kernel module.
 
-## 9
+## 9. Ring 0 Verification
 
 The module ([src/ptwalk.c](src/ptwalk.c)) takes a pid and a virtual address. It finds that process's `task_struct`, gets its `mm_struct` (which holds the CR3 value), and walks all four levels. It prints every entry's raw hex value, index, and the final frame number with permission bits. It exposes the result at `/proc/ptwalk`.
 
@@ -202,7 +202,7 @@ But bits 12-51 of both PTEs encode `0x6f16a`. Same frame. Same DRAM row. Two sep
 
 Both have `write = 0`. The trap is armed. The first process to store a byte here will fault.
 
-## 10
+## 10. The Trap Handling
 
 To prove the trap fires, we don't need to read pagemap. We can watch the kernel function that handles it.
 
@@ -221,7 +221,7 @@ The kernel calls `do_wp_page()` when a write hits a read-only page that was once
 
 pid 42109 = parent. pid 42110 = child. Multiple traps — not just `num`, but stack pages, libc data pages, everything that was shared and then written.
 
-## 11
+## 11. Tracing the Fork
 
 We also traced `fork()` itself. The kernel function is `kernel_clone`. We attached both a pre-handler (fires when `kernel_clone` starts) and a return-handler (fires when it finishes, captures the return value).
 
@@ -236,7 +236,7 @@ We also traced `fork()` itself. The kernel function is `kernel_clone`. We attach
 
 One call. Return value 40283 = child pid. In the child's context, the saved `rax` was set to 0. Two tasks, one `kernel_clone`, divergence in one register.
 
-## 12
+## 12. Userspace Verification
 
 Same thing without a kernel module, using eBPF from userspace:
 
@@ -261,7 +261,7 @@ No module to compile. No `insmod`. One command. Same proof.
 
 ---
 
-## What happened
+## Summary of Operations
 
 ```
 BEFORE fork():
@@ -321,7 +321,7 @@ AFTER child writes num = 42:
 
 ---
 
-## Run it yourself
+## Reproduction Steps
 
 ```bash
 # compile everything
@@ -369,7 +369,7 @@ sudo bpftrace -c ./fork_test -e '
   }'
 ```
 
-## What you need
+## Prerequisites
 
 - Linux x86_64 with kernel headers installed (`apt install linux-headers-$(uname -r)`)
 - gcc, make
