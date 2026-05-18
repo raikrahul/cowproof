@@ -319,6 +319,8 @@ AFTER child writes num = 42:
    refcount = 1                             refcount = 1
 ```
 
+REFCOUNT DRIVER: mmap(4096) MAP_PRIVATE → write 100 → fork() → refcount=2 (shared physical frame 0x401c07) → child write 42 → page fault → alloc_page() → copy 4096 bytes → parent refcount=1 (frame 0x401c07) child refcount=1 (frame 0x268b1f) ∴ WRITE triggers split and decrements original refcount. ASYMMETRY DRIVER: fork() sets PTE R/W=0 → instruction fetch read = 0 traps ✓ → child read variable = 180 CPU cycles ✓ → child write variable = 16140 CPU cycles ✗ → kretprobe do_wp_page measures 5700 cycles inside ring 0 ✗ → READ costs 0 traps ∴ WRITE costs 5700 cycles ∴ PTE hardware checks R/W only on write instructions.
+
 ---
 
 ## Reproduction Steps
@@ -330,6 +332,8 @@ gcc -o fork_test 01_fork_test.c
 gcc -o cow_test 02_cow_test.c
 gcc -o pfn_proof 03_pfn_proof.c
 gcc -o cow_hold 04_cow_hold.c
+gcc -o cow_refcount 05_cow_refcount_test.c
+gcc -o cow_speed 07_cow_speed.c
 make   # builds kernel modules
 
 # proof 1: fork trace
@@ -367,7 +371,22 @@ sudo bpftrace -c ./fork_test -e '
   kretprobe:kernel_clone /comm == "fork_test"/ {
     printf("clone returned %d\n", retval);
   }'
+
+# proof 6: refcount split
+sudo dmesg -c > /dev/null
+sudo insmod refcount_proof.ko
+./cow_refcount
+sudo rmmod refcount_proof
+sudo dmesg
+
+# proof 7: read vs write cost
+sudo dmesg -c > /dev/null
+sudo insmod kprobe_fault.ko
+./cow_speed
+sudo rmmod kprobe_fault
+sudo dmesg
 ```
+
 
 ## Prerequisites
 

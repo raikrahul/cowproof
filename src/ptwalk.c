@@ -61,9 +61,10 @@ static void walk_page_table(struct seq_file *m, struct mm_struct *mm,
     pfn = pte_pfn(*pte);
     seq_printf(m, "  PTE val=0x%lx  (index %lu)\n", pte_val(*pte), pte_index(va));
     seq_printf(m, "  PFN = 0x%lx  phys = 0x%lx\n", pfn, pfn << PAGE_SHIFT);
-    seq_printf(m, "  present=%d  write=%d  dirty=%d  young=%d\n",
+    seq_printf(m, "  P=%d  R/W=%d  U/S=%d  D=%d  CoW(bit58)=%lu\n",
                pte_present(*pte), pte_write(*pte),
-               pte_dirty(*pte), pte_young(*pte));
+               (pte_val(*pte) & (1 << 2)) ? 1 : 0, pte_dirty(*pte),
+               (pte_val(*pte) >> 58) & 1);
 }
 
 /* target_pid: set via module param, walk this process's page table */
