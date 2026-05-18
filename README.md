@@ -4,6 +4,20 @@ When you call `fork()`, does your data get copied? Every OS textbook says "copy 
 
 Kernel: `7.0.0-070000rc4-generic` (x86_64). All code compiles and runs. Logs are real.
 
+By Rahul — systems writing that proves what textbooks assert.
+
+What you'll have measured by the end:
+
+- 9 proofs of copy-on-write, run on real hardware
+- 4 ring 0 kernel modules (page table walk, refcount, VMA flag check, write trap)
+- 2 eBPF / kprobe paths (one of them needs no module load)
+- Real 4-level page table walks: CR3, PGD, PUD, PMD, PTE — every entry in hex
+- Real PFNs from two processes: same number before write, different number after
+- The "measurement disturbs the thing measured" lesson, from two failed attempts that ship in this repo
+- A working SIGSEGV when you try to write to a `libc.so` `.text` page
+
+Follow: <https://github.com/raikrahul> · Sponsor: <https://github.com/sponsors/raikrahul>
+
 ---
 
 ## 1. The Question
@@ -149,12 +163,17 @@ But pagemap only shows the final frame number. The CPU doesn't jump straight to 
 ```
 Virtual address: 0x7526eab4f000
 
-bits 47-39   index into table 1 (PGD)     = 234
-bits 38-30   index into table 2 (PUD)     = 155
-bits 29-21   index into table 3 (PMD)     = 341
-bits 20-12   index into table 4 (PTE)     = 335
-bits 11-0    byte offset in the frame     = 0x000
+Top 48 bits sliced into the 5 fields the CPU consumes:
+
+  011101010   010011011   101010101   101001111   000000000000
+  bits 47-39  bits 38-30  bits 29-21  bits 20-12  bits 11-0
+  PGD index   PUD index   PMD index   PTE index   byte offset
+  = 234       = 155       = 341       = 335       = 0
 ```
+
+Each table index is 9 bits because each table holds 2^9 = 512 entries × 8 bytes
+= 4096 bytes = exactly one page. The bottom 12 bits are not an index; they're a
+byte offset inside the 4096-byte physical frame the PTE points at.
 
 The CPU reads the CR3 register → that's the physical address of table 1. It reads entry 234 from that table → gets the physical address of table 2. Reads entry 155 → table 3. Entry 341 → table 4. Entry 335 → the final 64-bit integer with the frame number.
 
@@ -319,7 +338,50 @@ AFTER child writes num = 42:
    refcount = 1                             refcount = 1
 ```
 
-REFCOUNT DRIVER: mmap(4096) MAP_PRIVATE → write 100 → fork() → refcount=2 (shared physical frame 0x401c07) → child write 42 → page fault → alloc_page() → copy 4096 bytes → parent refcount=1 (frame 0x401c07) child refcount=1 (frame 0x268b1f) ∴ WRITE triggers split and decrements original refcount. ASYMMETRY DRIVER: fork() sets PTE R/W=0 → instruction fetch read = 0 traps ✓ → child read variable = 180 CPU cycles ✓ → child write variable = 16140 CPU cycles ✗ → kretprobe do_wp_page measures 5700 cycles inside ring 0 ✗ → READ costs 0 traps ∴ WRITE costs 5700 cycles ∴ PTE hardware checks R/W only on write instructions. LIBC SHARING DRIVER: dlsym(printf) → get_pfn() parent PFN=0x10e2b5 → fork() → child get_pfn() PFN=0x10e2b5 ∴ child shares identical physical page-cache frame. WRITE TEST: child write *(char*)printf = 0x90 → SIGSEGV caught ✗ → VMA PROOF: find_vma() → vma->vm_flags & VM_WRITE = 0 ∴ PTE R/W=0 && VM_WRITE=0 → illegal write → kernel denies CoW → triggers SEGV ∴ NO CoW FOR LIBC ∴ PFN stays same forever.
+### Driver 1: refcount
+
+```
+mmap(4096) MAP_PRIVATE → *num = 100 → fork()
+→ refcount = 2 on physical frame 0x401c07
+→ child writes 42 → #PF
+→ alloc_page() → memcpy 4096 bytes → new frame 0x268b1f
+→ parent: refcount=1 on 0x401c07
+→ child:  refcount=1 on 0x268b1f
+```
+
+∴ a write splits the page and decrements the original frame's refcount.
+
+### Driver 2: read/write asymmetry
+
+```
+fork() clears PTE R/W bit to 0 on writable user pages
+→ child instruction fetch (read) = 0 traps                  ✓
+→ child reads variable            = 180 cycles              ✓
+→ child writes variable           = 16,140 cycles           ✗
+→ kretprobe on do_wp_page         = 5,700 cycles in ring 0  ✗
+```
+
+∴ reads cost 0 traps; writes cost ~5,700 cycles inside the kernel handler.
+∴ the hardware checks the R/W bit only on writes — reads always pass when P=1.
+
+### Driver 3: `libc.so` `.text` sharing (no CoW involved)
+
+```
+dlsym(printf) → get_pfn() in parent  → PFN = 0x10e2b5
+→ fork() → child get_pfn()           → PFN = 0x10e2b5
+```
+
+∴ child reads the same page-cache frame as the parent. Same physical bytes.
+
+```
+child writes *(char*)printf = 0x90 (NOP)
+→ SIGSEGV caught                                       ✗
+→ vma_proof.ko: find_vma() finds vm_flags & VM_WRITE = 0
+```
+
+∴ PTE R/W=0 **and** VMA has no VM_WRITE → write is illegal, not a CoW
+→ kernel sends SIGSEGV instead of allocating a new frame.
+∴ the PFN stays the same forever — shared without CoW.
 
 ---
 
@@ -355,13 +417,18 @@ sudo ./pfn_proof
 
 # proof 4: full page table walk from ring 0
 ./cow_hold &
-# (it prints the insmod commands — run them)
-sudo insmod ptwalk.ko target_pid=<PARENT> target_va=<ADDR>
-sudo cat /proc/ptwalk
-sudo rmmod ptwalk
-sudo insmod ptwalk.ko target_pid=<CHILD> target_va=<ADDR>
-sudo cat /proc/ptwalk
-sudo rmmod ptwalk
+# cow_hold mmaps a page, forks, prints the exact commands you need, then both
+# processes sleep for 30 s so the module has time to read them. Output is like:
+#
+#   sudo insmod ptwalk.ko target_pid=43451 target_va=128810006933504
+#   sudo cat /proc/ptwalk        # parent walk
+#   sudo rmmod ptwalk
+#   sudo insmod ptwalk.ko target_pid=43452 target_va=128810006933504
+#   sudo cat /proc/ptwalk        # child walk
+#   sudo rmmod ptwalk
+#
+# Copy-paste those four lines. Compare CR3, the four indices, and the PFN.
+# Both PFNs match before any write; only the PTE bits differ.
 
 # proof 5: ebpf one-liner (no modules needed)
 sudo bpftrace -c ./fork_test -e '
@@ -404,6 +471,15 @@ sudo dmesg
 - gcc, make
 - bpftrace (for proof 5)
 - sudo (page table reads and kernel modules need ring 0)
+
+## More like this
+
+Follow on GitHub: <https://github.com/raikrahul>
+Sponsor: <https://github.com/sponsors/raikrahul>
+
+If you want the rest of this style — process lifecycle, malloc internals, ext4
+on-disk layout, all derived from bytes and registers, never from textbook
+hand-waves — the sponsor page is where I'll be putting the longer pieces.
 
 ## License
 
