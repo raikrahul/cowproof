@@ -462,6 +462,14 @@ sudo dmesg -c > /dev/null
 sudo insmod vma_proof.ko target_pid=$$ target_va=0x$(cat /proc/self/maps | grep libc.so | head -n 1 | awk -F'-' '{print $1}')
 sudo rmmod vma_proof
 sudo dmesg
+
+# proof 10: cross-process PFN read (any two PIDs sharing libc.so)
+gcc -o libc_shared_pfn 10_libc_shared_pfn.c
+sudo ./libc_shared_pfn $(pgrep -n bash)
+# Reads /proc/self/maps + /proc/<other>/maps to locate the libc r-xp VMA in
+# each process, then reads PFN from /proc/<pid>/pagemap for both. Expected:
+# same PFN value in two processes that have no fork relationship — proof that
+# page-cache sharing is the mechanism, not CoW.
 ```
 
 
@@ -471,6 +479,259 @@ sudo dmesg
 - gcc, make
 - bpftrace (for proof 5)
 - sudo (page table reads and kernel modules need ring 0)
+
+## 13. Confusions cleared
+
+A real reader walked this proof in one session. The points below are the spots
+where the picture broke and how the bytes resolved each one.
+
+### Q&A in real bits
+
+```
+Q: parent and child have different CR3. Do they share page tables?
+   CR3_parent = 0x9c672000   CR3_child = 0x21ea6000     ✗ different physical pages
+   PGD_parent[234] = 0x2034c067   PGD_child[234] = 0x1f7b1067   ✗ different entries
+   PTE_parent.PFN  = 0x6f16a      PTE_child.PFN  = 0x6f16a       ✓ same PFN
+∴ tables at different physical addresses; only the leaf PFN value coincides at fork.
+
+Q: &num same VA in both processes?
+   parent &num = 0x7526eab4f000   child &num = 0x7526eab4f000     ✓ same
+   address space layout cloned bit-for-bit by fork → same RSP → same compiler-chosen offset
+∴ VA same, page walks different, PFN same → both VAs land on one DRAM row at fork.
+
+Q: is there a CoW bit in the PTE?
+   x86_64 PTE bits used by hardware: P R/W U/S PWT PCD A D PS G NX PFN
+   Linux software bits in PTE: SOFT_DIRTY, SPECIAL, PROTNONE, UFFD_WP
+   ✗ no CoW bit
+   kernel decides CoW at fault time from:
+     PTE R/W == 0  AND  vma->vm_flags & VM_WRITE       → CoW fault
+     PTE R/W == 0  AND  !(vma->vm_flags & VM_WRITE)    → SIGSEGV
+∴ "CoW" is a fault classification, not a stored bit.
+
+Q: does R/W=0 block reads?
+   CPU permission check on memory access:
+     access type = read   → check P only (and U/S vs CS.RPL)
+     access type = write  → check P + R/W
+   PTE = P=1 R/W=0 U/S=1
+   read instruction  → 0 traps         ✓
+   write instruction → #PF vector 14   ✗
+∴ asymmetric. reads pass; only writes trap. lazy CoW depends on this.
+
+Q: if hardware checked R/W on reads too, would lazy CoW still work?
+   instruction fetch is a read.  .text PTE has R/W=0.
+   child's first mov after fork → fault → kernel copies .text page → flips R/W=1
+   next instruction → fault again on next .text page
+   ✗ child copies entire .text before executing one user instruction
+   measured: do_wp_page costs 5,700 cycles in ring 0; normal load is 1-4 cycles
+   ratio: 1,000× slower if every read faulted
+∴ scheme is unworkable; reads must be free.
+
+Q: U/S bit?
+   bit 2 of PTE.
+   1 = ring 3 may access     (user code, user data, user stack)
+   0 = ring 0 only           (kernel half, vaddr ≥ 0xffff800000000000)
+   ring 3 access of U/S=0 page → #PF, error code bit 2 (U) = 1
+   kernel handler delivers SIGSEGV to the offending task.
+∴ U/S fences kernel memory out of user reach without unmapping it.
+
+Q: child "gets a new libc" after fork?
+   fork mechanism = clone task_struct, alloc new PML4, copy PTEs entry by entry
+   ✗ no mmap, ✗ no dlopen, ✗ no library reload
+   child's PTE for libc.so .text VA = copy of parent's PTE
+   parent's PTE was already pointing at the page-cache frame
+∴ same PFN inherited transitively. library reload happens only on execve, not fork.
+
+Q: can I predict the exact PFN of a page?
+   kernel frame allocator (buddy) hands out free PFNs at alloc time
+   varies per boot, per run, per allocation timing
+   ✗ unpredictable
+   /proc/<pid>/pagemap exposes it: entry = (PFN bits 0..54) | (present << 63)
+   non-root readers see PFN bits = 0  (rowhammer mitigation since kernel 4.0)
+∴ run with sudo to read PFN; relationships (same/different) are predictable, values are not.
+
+Q: parent blocks on read(). where do its registers live?
+   user-mode rax..r15 = pushed to kernel stack as struct pt_regs at syscall entry
+   kernel-resumption rsp = saved in parent->thread.sp inside thread_struct
+   fs, gs (TLS) = saved in thread_struct
+   in CPU registers right now = some OTHER task's state
+   CR3 = some OTHER task's mm->pgd
+∴ registers physically reside in DRAM, not silicon, while the task is descheduled.
+
+Q: parent never calls wait(). child _exit(0). what happens?
+   do_exit on child:
+     exit_mm → mm refcount drops, possibly freed
+     exit_files → all fds closed
+     state = TASK_DEAD, exit_state = EXIT_ZOMBIE
+     task_struct stays (8 KB), pid stays allocated
+   parent exits later:
+     forget_original_parent reparents zombie children to init (pid 1)
+   init's wait4 loop reaps zombies → release_task → free task_struct → pid back in pool
+∴ unwaited zombie lives until parent exits; init reaps; ~µs window in short programs.
+```
+
+### Mistakes made this session (line → what went wrong → what should be → why sloppy → what missed → how to prevent)
+
+```
+M1  "different CR3 but they contain same things because both point to the same table"
+    wrong: tables are at different physical pages
+    right: 8-byte entries inside encode the same PFN at fork; the table pages differ
+    why sloppy: collapsed "table" and "table contents" into one word
+    missed: a page table is itself a 4096-byte chunk in DRAM with its own PFN
+    prevent: when saying "table" name which level (PML4/PUD/PMD/PTE) and ask
+             "the physical page that holds this table" vs "the bytes inside it"
+
+M2  "what is the CoW structure bit?  is this bit 58?"
+    wrong: no such bit exists in Linux's PTE encoding
+    right: kernel infers CoW from PTE R/W=0 AND VMA VM_WRITE=1; struct page _refcount
+           decides copy vs flip
+    why sloppy: assumed every kernel concept maps to one bit
+    missed: kernel mechanism is layered (PTE + VMA + struct page); single-bit mental
+            model under-captures it
+    prevent: when asked "which bit?" first ask "is the mechanism in hardware bits,
+             kernel software bits, VMA flags, or page metadata?"  often more than one
+
+M3  "if R/W gated reads, scheme is workable; just copy and decrement refcount"
+    wrong: every instruction fetch is a read; child's first mov faults; .text pages
+           all have R/W=0; child copies entire .text before running anything
+    right: lazy CoW requires reads to be free; only writes pay
+    why sloppy: only considered data pages, not code pages
+    missed: instruction fetches go through the same PTE permission check
+    prevent: when reasoning about R/W behavior, think of the code segment (.text)
+             which is always R/W=0 read-only
+
+M4  "the PFN will differ because we have different ram address but all higher level
+     translations will be same"
+    wrong: inverted both halves
+    right: higher-level table pages are at DIFFERENT physical addresses; their
+           entry values are the same at fork; leaf PFN is the SAME value
+    why sloppy: confused where a value lives with what value it holds
+    missed: "different physical address" describes location of the table, not
+            content of the table entry
+    prevent: separate "the page that holds X" from "the value of X" in any
+             page-table reasoning
+
+M5  "after fork the child gets a new libc"
+    wrong: fork inherits, does not reload
+    right: only execve replaces the address space; fork clones it
+    why sloppy: collapsed fork and exec into one operation
+    missed: exec is the operation that mmaps the new ELF and its dependencies
+    prevent: when claiming "the address space changed", ask "did execve run?"
+
+M6  "read(pipe_fd[0], \"\", 1) works fine"
+    wrong: destination "" is a string literal in .rodata; copy_to_user fails with
+           EFAULT; read returns -1
+    why-it-still-works: pipe_read blocks on empty buffer BEFORE attempting copy;
+           wakeup happens before EFAULT; ignored return value masks the error
+    why sloppy: used the first throwaway pointer at hand
+    missed: kernel writes 1 byte to the user-supplied address; address must be
+            writable from user perspective
+    prevent: any syscall whose buffer the kernel writes into needs a stack-local
+             (R/W=1, U/S=1) destination
+             char c; read(fd, &c, 1);
+
+M7  "i do not know this fflush trick"
+    confusion: why does the child need fflush(stdout) between printf and the
+               sync-pipe write?
+    bytes: printf writes into a libc-managed buffer in YOUR heap (4096 bytes
+           by default, malloc'd on first stdout use).
+           The kernel's stdout pipe (fd 1) only receives bytes when libc
+           calls write(1, buf, n). libc emits that on:
+             (a) buffer full
+             (b) explicit fflush(stdout)
+             (c) atexit handler installed by exit(0)
+           _exit(0) bypasses (c). _exit destroys the address space without
+           running libc cleanup → bytes still in the heap buffer are LOST.
+           Codio captures stdout via a pipe → fully buffered (line buffering
+           is a terminal-only mode).
+    wrong without fflush:
+           child does printf → 21 bytes in libc buffer (heap, child-private)
+           child does write(sync_pipe, "x", 1) → parent wakes
+           parent does printf → bytes in parent's libc buffer
+           parent returns from main → libc atexit → write(1, parent_buf, 24)
+                → "Goodbye from the parent\n" in kernel stdout pipe
+           child does _exit(0) → no libc cleanup → child's 21 bytes vanish
+           Codio sees only parent's line → wrong output
+    right: child sequence is printf, fflush(stdout), write(sync_pipe, ...),
+           _exit(0). fflush emits write(1, buf, 21) FIRST, so the child's bytes
+           are in the kernel pipe before the parent ever wakes.
+    why sloppy: treated printf as if it called write(1, ...) directly.
+    missed: two buffers in the path — libc's heap buffer and the kernel pipe
+            buffer. Codio reads the kernel one.
+    prevent: any printf whose bytes must arrive before a later event needs an
+             explicit flush. Terminal line-buffering hides this in development;
+             pipes/files behave differently.
+
+M8  "codio failed me with 'Try not to use wait()' but my code has no wait() call"
+    bytes: grep -i wait exercise_2.c hit three matches in COMMENTS:
+             line  8: "Parent must NOT call wait()."           (spec restatement)
+             line 25: "Expected output (deterministic, parent NEVER waits):"
+             line 110: "No wait() call anywhere."              (own commentary)
+           Codio's grader is doing source-text substring match — not AST,
+           not strace, not ptrace. The match doesn't care about /* */.
+    wrong assumption: comments are invisible to graders.
+    right model: an auto-grader runs the cheapest static check first; substring
+                 grep is cheaper than running the binary. Comments are part of
+                 the file the regex sees.
+    why sloppy: copy-pasted spec language into TODO comments without thinking
+                about how the grader reads the file.
+    missed: the grader's banned-API check sees every byte of the source,
+            including documentation that refers to the API by name.
+    prevent: when an auto-grader bans API X, also strip the literal string X
+             from comments. Synonym or behavior description only.
+
+M9  "i should be able to predict the exact PFN"
+    bytes: kernel buddy allocator hands out free PFNs in whatever order frames
+           became free. Influenced by:
+             - boot time (different on every reboot)
+             - other tasks alloc/free history
+             - memory pressure
+             - NUMA node placement
+           same code, same input, different runs → different PFN values.
+    wrong: assumed PFN = deterministic function of the source.
+    right: PFN values are observations, not predictions. What IS predictable:
+             - relationships ("parent and child agree at fork")
+             - changes  ("after writer faults, PFNs differ")
+             - constants ("libc.so .text PFN is stable across the whole boot
+                          because the page-cache entry is sticky")
+    why sloppy: pattern-matched PFN onto deterministic compiler outputs (e.g.
+                offsets, symbol addresses) which ARE predictable.
+    missed: anything the kernel allocates at runtime has non-deterministic
+            naming; only file-backed mappings get stable identities (via inode +
+            file offset → page cache).
+    prevent: ask "is this from the linker/compiler or from the kernel?" Linker
+             outputs are stable; kernel allocator outputs are not.
+```
+
+### New driver: cross-process PFN reader
+
+```
+src/10_libc_shared_pfn.c
+
+Build: gcc -o libc_shared_pfn 10_libc_shared_pfn.c
+Run:   sudo ./libc_shared_pfn <other_pid>
+
+Mechanism:
+  /proc/self/maps   → grep r-xp libc → start VA = first VA mapped to libc.so + 0
+  /proc/<other>/maps → same → other process's start VA (different value due to
+                       ASLR, same file offset)
+  /proc/self/pagemap @ (self_va / 4096) * 8       → 8-byte entry; PFN = bits 0..54
+  /proc/<other>/pagemap @ (other_va / 4096) * 8   → same
+
+Expected output:
+  self  PFN = 0x18b3a   phys = 0x18b3a000
+  other PFN = 0x18b3a   phys = 0x18b3a000
+  SAME physical frame: libc.so first .text page is shared.
+
+Why same PFN with no fork relationship:
+  kernel inode->i_mapping (struct address_space) holds (file_offset → struct page)
+  every mmap(libc.so, ..., MAP_PRIVATE, offset 0) calls filemap_fault on first
+  touch → find_get_page(mapping, 0) returns the single cached struct page →
+  PTE points at its PFN. All N processes' PTEs end up pointing at one frame.
+
+Failure mode without sudo:
+  /proc/<pid>/pagemap returns PFN bits zeroed (rowhammer mitigation since 4.0).
+  Result: both PFNs = 0, comparison meaningless. tool reports the error.
+```
 
 ## More like this
 
