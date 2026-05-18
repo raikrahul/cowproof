@@ -2,3 +2,4 @@ kprobe_fork.o
 kprobe_cow.o
 ptwalk.o
 refcount_proof.o
+vma_proof.o

@@ -6,3 +6,4 @@ default:
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 obj-m += refcount_proof.o
+obj-m += vma_proof.o

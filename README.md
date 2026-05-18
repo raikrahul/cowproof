@@ -319,7 +319,7 @@ AFTER child writes num = 42:
    refcount = 1                             refcount = 1
 ```
 
-REFCOUNT DRIVER: mmap(4096) MAP_PRIVATE → write 100 → fork() → refcount=2 (shared physical frame 0x401c07) → child write 42 → page fault → alloc_page() → copy 4096 bytes → parent refcount=1 (frame 0x401c07) child refcount=1 (frame 0x268b1f) ∴ WRITE triggers split and decrements original refcount. ASYMMETRY DRIVER: fork() sets PTE R/W=0 → instruction fetch read = 0 traps ✓ → child read variable = 180 CPU cycles ✓ → child write variable = 16140 CPU cycles ✗ → kretprobe do_wp_page measures 5700 cycles inside ring 0 ✗ → READ costs 0 traps ∴ WRITE costs 5700 cycles ∴ PTE hardware checks R/W only on write instructions.
+REFCOUNT DRIVER: mmap(4096) MAP_PRIVATE → write 100 → fork() → refcount=2 (shared physical frame 0x401c07) → child write 42 → page fault → alloc_page() → copy 4096 bytes → parent refcount=1 (frame 0x401c07) child refcount=1 (frame 0x268b1f) ∴ WRITE triggers split and decrements original refcount. ASYMMETRY DRIVER: fork() sets PTE R/W=0 → instruction fetch read = 0 traps ✓ → child read variable = 180 CPU cycles ✓ → child write variable = 16140 CPU cycles ✗ → kretprobe do_wp_page measures 5700 cycles inside ring 0 ✗ → READ costs 0 traps ∴ WRITE costs 5700 cycles ∴ PTE hardware checks R/W only on write instructions. LIBC SHARING DRIVER: dlsym(printf) → get_pfn() parent PFN=0x10e2b5 → fork() → child get_pfn() PFN=0x10e2b5 ∴ child shares identical physical page-cache frame. WRITE TEST: child write *(char*)printf = 0x90 → SIGSEGV caught ✗ → VMA PROOF: find_vma() → vma->vm_flags & VM_WRITE = 0 ∴ PTE R/W=0 && VM_WRITE=0 → illegal write → kernel denies CoW → triggers SEGV ∴ NO CoW FOR LIBC ∴ PFN stays same forever.
 
 ---
 
@@ -384,6 +384,16 @@ sudo dmesg -c > /dev/null
 sudo insmod kprobe_fault.ko
 ./cow_speed
 sudo rmmod kprobe_fault
+sudo dmesg
+
+# proof 8: libc page cache sharing and SEGV
+sudo gcc -o 08_libc_shared 08_libc_shared.c -ldl
+sudo ./08_libc_shared
+
+# proof 9: vma flags kernel test
+sudo dmesg -c > /dev/null
+sudo insmod vma_proof.ko target_pid=$$ target_va=0x$(cat /proc/self/maps | grep libc.so | head -n 1 | awk -F'-' '{print $1}')
+sudo rmmod vma_proof
 sudo dmesg
 ```
 
